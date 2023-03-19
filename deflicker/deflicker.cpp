@@ -95,6 +95,7 @@ private:
     int get_cache_number(int ndest);
     int get_free_cache_number();
     void get_frame_stats(size_t n_frame, IScriptEnvironment* env, double* mean, double* var);
+    int fill_cache_for_smoothed(int ndest, IScriptEnvironment* env);
 };
 
 /***************************
@@ -885,17 +886,65 @@ void Deflicker::get_frame_stats(size_t n_frame, IScriptEnvironment* env, double*
     *o_var = var;
 }
 
+int Deflicker::fill_cache_for_smoothed(int ndest, IScriptEnvironment* env)
+{
+    int lagsign;
+
+    if (lag > 0) lagsign = 1;
+    else if (lag < 0) lagsign = -1;  // lag <0
+    else return -1; // lag=0: really it's not possible to get here with zero lag
+
+    int nbase = ndest - range * lagsign; // base is some prev or some next
+    if (nbase < 0) nbase = 0;
+    if (nbase > vi.num_frames - 1) nbase = vi.num_frames - 1;
+
+    int newbase = -1;
+
+    for (int ncur = ndest; ncur * lagsign >= nbase * lagsign; ncur -= lagsign)
+    {
+        double mean;
+        double var;
+
+        get_frame_stats(ncur, env, &mean, &var);
+
+        // check scenechange
+
+        if (var <= varnoise)
+        {			// check if noise variation correct
+            if (ncur != ndest)
+            { //then may be next as new scene
+                newbase = ncur + lagsign;// new scene at ncur+1
+            }
+            else {
+                newbase = ncur;
+            }
+            break; // bad frame, use next as new scene
+        }
+
+        if (ncur != ndest)
+        { //then may be next as new scene
+            int n = get_cache_number(ncur + lagsign); // check  frame ncur+1 (previosly calculated)
+            if (abs(meancache[n] - mean) > scene || 2 * fabs(sqrt(varcache[n]) - sqrt(var)) > scene)
+            {
+                // we compared mean luma and std.var with previous for new scene detect
+                newbase = ncur + lagsign;// new scene at ncur+1
+                break;
+            }
+        }
+    }
+    return newbase;
+}
+
 PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   // This is the implementation of the GetFrame function.
   // See the header definition for further info.
 
   int w, h;
-  int ncur, n, nbase;
-  double mean, var, meancur;
+  int n, nbase;
+  double meancur;
   double meansmoothed;
   double a, b, alfa, beta, var_y;
   double mult, add;
-  int newbase;
   int lagsign; // sign of the lag
 
   int lastsrc = -1;
@@ -930,37 +979,7 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   if (nbase < 0) nbase = 0;
   if (nbase > vi.num_frames - 1) nbase = vi.num_frames - 1;
 
-  newbase = -1;
-
-  for (ncur = ndest; ncur * lagsign >= nbase * lagsign; ncur -= lagsign)
-  {
-    get_frame_stats(ncur, env, &mean, &var);
-
-    // check scenechange
-
-    if (var <= varnoise)
-    {			// check if noise variation correct
-      if (ncur != ndest)
-      { //then may be next as new scene
-        newbase = ncur + lagsign;// new scene at ncur+1
-      }
-      else {
-        newbase = ncur;
-      }
-      break; // bad frame, use next as new scene
-    }
-
-    if (ncur != ndest)
-    { //then may be next as new scene
-      n = get_cache_number(ncur + lagsign); // check  frame ncur+1 (previosly calculated)
-      if (abs(meancache[n] - mean) > scene || 2 * fabs(sqrt(varcache[n]) - sqrt(var)) > scene)
-      {
-        // we compared mean luma and std.var with previous for new scene detect
-        newbase = ncur + lagsign;// new scene at ncur+1
-        break;
-      }
-    }
-  }
+  int newbase = fill_cache_for_smoothed(ndest, env);
 
   if (newbase >= 0) nbase = newbase;
   // calculate initial state (for base frame)
@@ -968,13 +987,12 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
 
   // some intial values for model parameters:
   meansmoothed = meancache[n];//  mean luma
-  var = varcache[n]; // variation
+  double var = varcache[n]; // variation
   // initial coeff.
   mult = 1;
   add = 0;
   a = 1; // multiplicative parameter
   b = 0; // additive parameter
-
 
  // we use luma stablization method from AURORA 
 
@@ -982,7 +1000,7 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   if ((nbase + lagsign) * lagsign <= ndest * lagsign && var > varnoise)
   { // and if base frame is not bad 
 
-    for (ncur = nbase + lagsign; ncur * lagsign <= ndest * lagsign; ncur += lagsign)
+    for (int ncur = nbase + lagsign; ncur * lagsign <= ndest * lagsign; ncur += lagsign)
     {
       // I use simplified AURORA method of Intensity flicker correction
 
