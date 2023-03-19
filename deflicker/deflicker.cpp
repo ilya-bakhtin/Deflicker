@@ -94,7 +94,7 @@ private:
     void clear_unnecessary_cache(int ndest, int range);
     int get_cache_number(int ndest);
     int get_free_cache_number();
-    void get_frame_stats(size_t n_frame, uint64_t* mean, uint64_t* var);
+    void get_frame_stats(size_t n_frame, IScriptEnvironment* env, double* mean, double* var);
 };
 
 /***************************
@@ -805,23 +805,96 @@ void SumFrame_c(const BYTE* srcp, int src_pitch, int width, int height, int bord
   }
 }
 
+void Deflicker::get_frame_stats(size_t n_frame, IScriptEnvironment* env, double* o_mean, double* o_var)
+{
+    int borderw;
+    if (isYUY2)
+        borderw = border * 2; // for YUY2
+    else
+        borderw = border; // for YV12
+
+    double mean;
+    double var;
+
+    // get min, max, and mean luma of current frame
+    // check cache
+    int n = get_cache_number(n_frame);
+    if (n >= 0)
+    { // from cache
+        mean = meancache[n];
+        var = varcache[n];
+    }
+    else
+    { // will calculate now
+        const PVideoFrame src = child->GetFrame(n_frame, env);
+ //       lastsrc = ncur;
+        // Request a Read pointer from the source frame.
+        const BYTE* srcp = src->GetReadPtr();
+        const int src_pitch = src->GetPitch();
+        const int src_width = src->GetRowSize();
+        const int src_height = src->GetHeight();
+
+        int64_t mean64 = 0; // mean luma, 32 ibt int is good for summing up 2^23 pixels (8 388 608) in 8 bit
+        int64_t var64 = 0; // luma variation
+        srcp += border * src_pitch + borderw; // start offset (skip border lines)
+        if (has_AVX2) {
+            if (isYUY2)
+                SumFrame_YUY2_avx2(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
+            else
+                SumFrame_avx2(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
+        }
+        else if (has_SSE2) {
+            if (isYUY2)
+                SumFrame_YUY2_sse2(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
+            else
+                SumFrame_sse2(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
+        }
+#ifndef X86_64
+        else if (has_SSE) {
+            if (isYUY2)
+                SumFrame_YUY2_isse(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
+            else
+                SumFrame_isse(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
+        }
+#endif
+        else {
+            if (isYUY2)
+                SumFrame_YUY2_c(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
+            else
+                SumFrame_c(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
+        }
+
+        if (isYUY2) {
+            mean = mean64 / ((src_height - 2 * border) * (src_width / 2 - borderw)); // norm mean value (*2 every 2) - changed in v.0.4
+            var = var64 / (((src_height - 2 * border) * (src_width / 2 - borderw))); // norm variation value (*2 every 2) - // changed in v.0.4
+        }
+        else {
+            mean = mean64 / ((src_height - 2 * border) * (src_width - 2 * borderw)); // norm mean value
+            var = var64 / (((src_height - 2 * border) * (src_width - 2 * borderw))); // norm variation value
+        }
+
+        var = var - mean*mean; // correction
+
+        // put to cache
+        n = get_free_cache_number();
+        cachelist[n] = n_frame;
+        meancache[n] = mean; // non-smoothed measured value
+        varcache[n] = var;
+    }
+    *o_mean = mean;
+    *o_var = var;
+}
 
 PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   // This is the implementation of the GetFrame function.
   // See the header definition for further info.
 
-  PVideoFrame src;// = child->GetFrame(ncur, env);
-  const BYTE* srcp;//= src->GetReadPtr();
-  int src_pitch;// = src->GetPitch();
-  int src_width;// = src->GetRowSize();
-  int src_height;// = src->GetHeight();
   int w, h;
   int ncur, n, nbase;
-  int mean, var, meancur;
+  double mean, var, meancur;
   double meansmoothed;
   double a, b, alfa, beta, var_y;
   double mult, add;
-  //	int mult256i, add256i;
   int newbase;
   int lagsign; // sign of the lag
 
@@ -835,7 +908,7 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
 
   if (range == 0)
   { // nothing to do, null transform ( may be  some intra-frame auto-gain in future versions)
-    src = child->GetFrame(ndest, env);
+    const PVideoFrame src = child->GetFrame(ndest, env);
     return src;
   }
 
@@ -843,11 +916,7 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   else if (lag < 0) lagsign = -1;  // lag <0
   else lagsign = 0; // lag=0: but it must be null transform above and return!
 
-
   clear_unnecessary_cache(ndest, range);
-
-
-
 
   // This code deals with YV12 colourspace where the Y, U and V information are
   // stored in completely separate memory areas
@@ -857,7 +926,6 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
 
   // So first of all deal with the Y Plane
 
-
   nbase = ndest - range * lagsign; // base is some prev or some next
   if (nbase < 0) nbase = 0;
   if (nbase > vi.num_frames - 1) nbase = vi.num_frames - 1;
@@ -866,73 +934,8 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
 
   for (ncur = ndest; ncur * lagsign >= nbase * lagsign; ncur -= lagsign)
   {
+    get_frame_stats(ncur, env, &mean, &var);
 
-    // get min, max, and mean luma of current frame
-    // check cache
-    n = get_cache_number(ncur);
-    if (n >= 0)
-    { // from cache
-      mean = meancache[n];
-      var = varcache[n];
-    }
-    else
-    { // will calculate now
-      src = child->GetFrame(ncur, env);
-      lastsrc = ncur;
-      // Request a Read pointer from the source frame.
-      srcp = src->GetReadPtr();
-      src_pitch = src->GetPitch();
-      src_width = src->GetRowSize();
-      src_height = src->GetHeight();
-
-
-      int64_t mean64 = 0; // mean luma, 32 ibt int is good for summing up 2^23 pixels (8 388 608) in 8 bit
-      int64_t var64 = 0; // luma variation
-      srcp += border * src_pitch + borderw; // start offset (skip border lines)
-      if (has_AVX2) {
-        if (isYUY2)
-          SumFrame_YUY2_avx2(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
-        else
-          SumFrame_avx2(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
-      }
-      else if (has_SSE2) {
-        if (isYUY2)
-          SumFrame_YUY2_sse2(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
-        else
-          SumFrame_sse2(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
-      }
-#ifndef X86_64
-      else if (has_SSE) {
-        if (isYUY2)
-          SumFrame_YUY2_isse(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
-        else
-          SumFrame_isse(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
-      }
-#endif
-      else {
-        if (isYUY2)
-          SumFrame_YUY2_c(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
-        else
-          SumFrame_c(srcp, src_pitch, src_width, src_height, borderw, border, &mean64, &var64);
-      }
-
-      if (isYUY2) {
-        mean = mean64 / ((src_height - 2 * border) * (src_width / 2 - borderw)); // norm mean value (*2 every 2) - changed in v.0.4
-        var = var64 / (((src_height - 2 * border) * (src_width / 2 - borderw))); // norm variation value (*2 every 2) - // changed in v.0.4
-      }
-      else {
-        mean = mean64 / ((src_height - 2 * border) * (src_width - 2 * borderw)); // norm mean value
-        var = var64 / (((src_height - 2 * border) * (src_width - 2 * borderw))); // norm variation value
-      }
-
-      var = var - mean * mean; // correction
-
-      // put to cache
-      n = get_free_cache_number();
-      cachelist[n] = ncur;
-      meancache[n] = mean; // non-smoothed measured value
-      varcache[n] = var;
-    }
     // check scenechange
 
     if (var <= varnoise)
@@ -1088,19 +1091,19 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
 
 
   // now make correction
-  if (lastsrc != ndest)
-  {
-    src = child->GetFrame(ndest, env); // get frame pointer if was not last processed
-  }
+//  if (lastsrc != ndest)
+//  {
+  PVideoFrame src = child->GetFrame(ndest, env); // get frame pointer if was not last processed
+//  }
   // Construct a frame based on the information of the current frame
   // contained in the "vi" struct.
   PVideoFrame dst = env->NewVideoFrame(vi);
 
   // Request a Read pointer from the source frame.
-  srcp = src->GetReadPtr();
-  src_pitch = src->GetPitch();
-  src_width = src->GetRowSize();
-  src_height = src->GetHeight();
+  const BYTE* srcp = src->GetReadPtr();
+  int src_pitch = src->GetPitch();
+  int src_width = src->GetRowSize();
+  int src_height = src->GetHeight();
 
 
   // Request a Write pointer from the newly created destination image.
