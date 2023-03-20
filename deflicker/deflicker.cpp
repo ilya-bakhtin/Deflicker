@@ -55,6 +55,7 @@ private:
 
   // internal parameters
   int range; // = abs(lag)
+  int lagsign; // sign of the lag
   double varnoise; // noise variation = noise*noise
 
   std::vector<int> cachelist;
@@ -94,8 +95,9 @@ private:
     void clear_unnecessary_cache(int ndest, int range);
     int get_cache_number(int ndest);
     int get_free_cache_number();
-    void get_frame_stats(size_t n_frame, IScriptEnvironment* env, double* mean, double* var);
+    void get_frame_stats(size_t n_frame, IScriptEnvironment* env, double& mean, double& var);
     int fill_cache_for_smoothed(int ndest, IScriptEnvironment* env);
+    void calculate_smoothed(int nbase, int ndest, double& o_meansmoothed, double& o_mult, double& o_add);
 };
 
 /***************************
@@ -142,6 +144,10 @@ Deflicker::Deflicker(PClip _child, double _percent, int _lag, double _noise, int
      
 
   range = abs(lag);
+
+  if (lag > 0) lagsign = 1;
+  else if (lag < 0) lagsign = -1;  // lag <0
+  else lagsign = 0; // really it will never be used
 
   if (percent < 0 || percent >100)
     env->ThrowError("Deflicker: percent must be from 0 to 100 !");
@@ -806,7 +812,7 @@ void SumFrame_c(const BYTE* srcp, int src_pitch, int width, int height, int bord
   }
 }
 
-void Deflicker::get_frame_stats(size_t n_frame, IScriptEnvironment* env, double* o_mean, double* o_var)
+void Deflicker::get_frame_stats(size_t n_frame, IScriptEnvironment* env, double& o_mean, double& o_var)
 {
     int borderw;
     if (isYUY2)
@@ -882,18 +888,12 @@ void Deflicker::get_frame_stats(size_t n_frame, IScriptEnvironment* env, double*
         meancache[n] = mean; // non-smoothed measured value
         varcache[n] = var;
     }
-    *o_mean = mean;
-    *o_var = var;
+    o_mean = mean;
+    o_var = var;
 }
 
 int Deflicker::fill_cache_for_smoothed(int ndest, IScriptEnvironment* env)
 {
-    int lagsign;
-
-    if (lag > 0) lagsign = 1;
-    else if (lag < 0) lagsign = -1;  // lag <0
-    else return -1; // lag=0: really it's not possible to get here with zero lag
-
     int nbase = ndest - range * lagsign; // base is some prev or some next
     if (nbase < 0) nbase = 0;
     if (nbase > vi.num_frames - 1) nbase = vi.num_frames - 1;
@@ -905,7 +905,7 @@ int Deflicker::fill_cache_for_smoothed(int ndest, IScriptEnvironment* env)
         double mean;
         double var;
 
-        get_frame_stats(ncur, env, &mean, &var);
+        get_frame_stats(ncur, env, mean, var);
 
         // check scenechange
 
@@ -935,17 +935,137 @@ int Deflicker::fill_cache_for_smoothed(int ndest, IScriptEnvironment* env)
     return newbase;
 }
 
+void Deflicker::calculate_smoothed(int nbase, int ndest, double& o_meansmoothed, double& o_mult, double& o_add)
+{
+    int n = get_cache_number(nbase);
+
+    // some intial values for model parameters:
+    double meansmoothed = meancache[n];//  mean luma
+    double var = varcache[n]; // variation
+    // initial coeff.
+    double mult = 1;
+    double add = 0;
+    double a = 1; // multiplicative parameter
+    double b = 0; // additive parameter
+
+    // we use luma stablization method from AURORA 
+
+    // for frames from base+1 to ndest
+    if ((nbase + lagsign) * lagsign <= ndest * lagsign && var > varnoise)
+    { // and if base frame is not bad 
+
+        for (int ncur = nbase + lagsign; ncur * lagsign <= ndest * lagsign; ncur += lagsign)
+        {
+            // I use simplified AURORA method of Intensity flicker correction
+
+            //Restoration of Archived Film and Video
+            //Van Roosmalen, Peter Michael Bruce
+            //Thesis Delft University of Technology - with ref. - with Summary in Dutch
+            //Printed by Universal Press, Veenendaal
+            //Cover photo: Philip Broos
+            //ISBN 90-901-2792-5
+            //Copyright © 1999 by P.M.B. van Roosmalen
+            // File "Restoration of Archived Film and Video 1999.pdf"
+
+            // Simplification: applied to whole frame, globally, without regions.
+
+            // degradation model of process :
+            // z(n) = alfa*y(n) + beta(n) + eta(n)
+            // z - measured luma
+            // y - true luma
+            // alfa - multiplicative flicker
+            // beta - additive flicker
+            // eta - noise
+
+            // solution (estimation):
+            // y(n) = a*z(n) + b(n)
+            // a - multiplicative parameter
+            // b - additive parameter
+
+            //assumption:
+            // Var(y(n)) variation is previuos yprev variation estimation,
+            // what is really var(a*zprev+b)=a*a*var(zprev)
+            double var_y = a * a * var; // variation of true y from old varequ and a,b
+
+            n = get_cache_number(ncur);
+            double meancur = meancache[n]; //  luma partially equlized mean value
+            var = varcache[n]; // new (current) variation of z
+            // var eta = varnoise
+            double alfa = sqrt((var - varnoise) / var_y); // alfa estimation
+
+            // E(z(n)) = meancur; // mean of z(n) is simply mean of luma
+
+            //assumption:
+            // E(y(n)) expectation is  percent mean y estimation:
+            // E(y(n-1)) = meansmoothed;  mean of y is percent y mean  estimation
+
+            // estimation solution:
+            double beta = meancur - alfa * meansmoothed;
+
+            a = sqrt((var - varnoise) / (var * alfa)); // the article has error: no sqrt!
+            b = -beta / alfa + meancur * (1 / alfa - a); // there was error too !
+
+            // that is all,
+            // pure solution:
+            meansmoothed = a * meancur + b;
+
+            //  but we can improve predicted solution by corrector,
+            //using calculated values for iteration
+            var_y = a * a * var; // variation of true y
+            alfa = sqrt((var - varnoise) / var_y); // alfa correction
+            beta = meancur - alfa * meansmoothed;  // alfa correction
+            a = sqrt((var - varnoise) / (var * alfa)); // the article has error, without sqrt!
+            b = -beta / alfa + meancur * (1 / alfa - a); // there was error too !
+
+            // prepare  for next frame calculation
+
+            // pure solution:
+            // meansmoothed = a*meancur + b;
+
+            // But we use some factor for stability
+            // y = k*(a*z+b) + (1-k)*z
+            // k = percent/100
+            // good k=0.85
+
+            // so modified stable solution for mean:
+            // meansmoothed = (percent/100)*(a*meancur + b) + (1-percent/100)*meancur;
+
+            // this may be rewrited:
+            // meansmoothed = meancur*(1 + (a-1)*percent/100) + b*percent/100;
+
+            // But the better we will use new mult and add:
+
+            mult = 1 + (a - 1) * percent / 100;
+            add = b * percent / 100;
+
+            // final for current frame, for next iteration:
+            meansmoothed = meancur * mult + add;
+
+        }
+        // we will use final summary mult and add for every original pixel
+    }
+
+    n = get_cache_number(ndest);
+
+    if (debug != 0)
+    {
+        sprintf(&debugbuf[0], "Deflicker: dest=%d base=%d mean=%5.1lf sq.var=%5.1lf mult=%5.3f add=%6.1f smoothed=%5.1f\n", ndest, nbase, meancache[n], sqrt(varcache[n]), mult, add, meansmoothed);
+        OutputDebugString(&debugbuf[0]);
+    }
+
+    o_meansmoothed = meansmoothed;
+    o_mult = mult;
+    o_add = add;
+}
+
 PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   // This is the implementation of the GetFrame function.
   // See the header definition for further info.
 
   int w, h;
   int n, nbase;
-  double meancur;
   double meansmoothed;
-  double a, b, alfa, beta, var_y;
   double mult, add;
-  int lagsign; // sign of the lag
 
   int lastsrc = -1;
 
@@ -960,10 +1080,6 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
     const PVideoFrame src = child->GetFrame(ndest, env);
     return src;
   }
-
-  if (lag > 0) lagsign = 1;
-  else if (lag < 0) lagsign = -1;  // lag <0
-  else lagsign = 0; // lag=0: but it must be null transform above and return!
 
   clear_unnecessary_cache(ndest, range);
 
@@ -982,124 +1098,8 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   int newbase = fill_cache_for_smoothed(ndest, env);
 
   if (newbase >= 0) nbase = newbase;
-  // calculate initial state (for base frame)
-  n = get_cache_number(nbase);
 
-  // some intial values for model parameters:
-  meansmoothed = meancache[n];//  mean luma
-  double var = varcache[n]; // variation
-  // initial coeff.
-  mult = 1;
-  add = 0;
-  a = 1; // multiplicative parameter
-  b = 0; // additive parameter
-
- // we use luma stablization method from AURORA 
-
- // for frames from base+1 to ndest
-  if ((nbase + lagsign) * lagsign <= ndest * lagsign && var > varnoise)
-  { // and if base frame is not bad 
-
-    for (int ncur = nbase + lagsign; ncur * lagsign <= ndest * lagsign; ncur += lagsign)
-    {
-      // I use simplified AURORA method of Intensity flicker correction
-
-      //Restoration of Archived Film and Video
-      //Van Roosmalen, Peter Michael Bruce
-      //Thesis Delft University of Technology - with ref. - with Summary in Dutch
-      //Printed by Universal Press, Veenendaal
-      //Cover photo: Philip Broos
-      //ISBN 90-901-2792-5
-      //Copyright © 1999 by P.M.B. van Roosmalen
-      // File "Restoration of Archived Film and Video 1999.pdf"
-
-      // Simplification: applied to whole frame, globally, without regions.
-
-      // degradation model of process :
-      // z(n) = alfa*y(n) + beta(n) + eta(n)
-      // z - measured luma
-      // y - true luma
-      // alfa - multiplicative flicker
-      // beta - additive flicker
-      // eta - noise
-
-      // solution (estimation):
-      // y(n) = a*z(n) + b(n)
-      // a - multiplicative parameter
-      // b - additive parameter
-
-      //assumption:
-      // Var(y(n)) variation is previuos yprev variation estimation,
-      // what is really var(a*zprev+b)=a*a*var(zprev)
-      var_y = a * a * var; // variation of true y from old varequ and a,b
-
-      n = get_cache_number(ncur);
-      meancur = meancache[n]; //  luma partially equlized mean value
-      var = varcache[n]; // new (current) variation of z
-      // var eta = varnoise
-      alfa = sqrt((var - varnoise) / var_y); // alfa estimation
-
-     // E(z(n)) = meancur; // mean of z(n) is simply mean of luma
-
-     //assumption:
-     // E(y(n)) expectation is  percent mean y estimation:
-     // E(y(n-1)) = meansmoothed;  mean of y is percent y mean  estimation
-
-     // estimation solution:
-      beta = meancur - alfa * meansmoothed;
-
-      a = sqrt((var - varnoise) / (var * alfa)); // the article has error: no sqrt!
-      b = -beta / alfa + meancur * (1 / alfa - a); // there was error too !
-
-      // that is all,
-      // pure solution:
-      meansmoothed = a * meancur + b;
-
-      //  but we can improve predicted solution by corrector,
-      //using calculated values for iteration
-      var_y = a * a * var; // variation of true y
-      alfa = sqrt((var - varnoise) / var_y); // alfa correction
-      beta = meancur - alfa * meansmoothed;  // alfa correction
-      a = sqrt((var - varnoise) / (var * alfa)); // the article has error, without sqrt!
-      b = -beta / alfa + meancur * (1 / alfa - a); // there was error too !
-
-      // prepare  for next frame calculation
-
-      // pure solution:
-      // meansmoothed = a*meancur + b;
-
-      // But we use some factor for stability
-      // y = k*(a*z+b) + (1-k)*z
-      // k = percent/100
-      // good k=0.85
-
-      // so modified stable solution for mean:
-      // meansmoothed = (percent/100)*(a*meancur + b) + (1-percent/100)*meancur;
-
-      // this may be rewrited:
-      // meansmoothed = meancur*(1 + (a-1)*percent/100) + b*percent/100;
-
-      // But the better we will use new mult and add:
-
-      mult = 1 + (a - 1) * percent / 100;
-      add = b * percent / 100;
-
-      // final for current frame, for next iteration:
-      meansmoothed = meancur * mult + add;
-
-    }
-    // we will use final summary mult and add for every original pixel
-
-  }
-
-
-  n = get_cache_number(ndest);
-
-  if (debug != 0)
-  {
-    sprintf(&debugbuf[0], "Deflicker: dest=%d base=%d mean=%5.1lf sq.var=%5.1lf mult=%5.3f add=%6.1f smoothed=%5.1f\n", ndest, nbase, meancache[n], sqrt(varcache[n]), mult, add, meansmoothed);
-    OutputDebugString(&debugbuf[0]);
-  }
+  calculate_smoothed(nbase, ndest, meansmoothed, mult, add);
 
   // get short integer scaled coefficients
 //	mult256i = mult*256;
@@ -1107,12 +1107,10 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   short mult256w = mult * 256;
   short addw = add;
 
-
   // now make correction
-//  if (lastsrc != ndest)
-//  {
+
   PVideoFrame src = child->GetFrame(ndest, env); // get frame pointer if was not last processed
-//  }
+
   // Construct a frame based on the information of the current frame
   // contained in the "vi" struct.
   PVideoFrame dst = env->NewVideoFrame(vi);
@@ -1296,4 +1294,3 @@ extern "C" __declspec(dllexport) const char* __stdcall AvisynthPluginInit3(IScri
   env->AddFunction("Deflicker", "c[percent]f[lag]i[noise]f[scene]i[lmin]i[lmax]i[border]i[info]b[debug]b[opt]i", Create_Deflicker, 0);
   return "Deflicker plugin";
 }
-
