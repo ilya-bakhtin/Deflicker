@@ -36,6 +36,17 @@
 #include "stdint.h"
 #include "immintrin.h"
 
+struct CacheEntry
+{
+    int frame;
+    double mean;
+    double var;
+    double mean_u;
+    double var_u;
+    double mean_v;
+    double var_v;
+};
+
 class Deflicker : public GenericVideoFilter {
   // Deflicker defines the name of your filter class. 
   // This name is only used internally, and does not affect the name of your filter or similar.
@@ -59,9 +70,7 @@ private:
   int lagsign; // sign of the lag
   double varnoise; // noise variation = noise*noise
 
-  std::vector<int> cachelist;
-  std::vector<double> meancache;
-  std::vector<double> varcache;
+  std::vector<CacheEntry> cache;
 
   std::vector<char> debugbuf;
   std::vector<char> messagebuf;
@@ -183,12 +192,10 @@ Deflicker::Deflicker(PClip _child, double _percent, int _lag, double _noise, int
 
   const size_t cachecapacity = static_cast<size_t>(range)*2 + 2; // with some reserve
 
-  cachelist.resize(cachecapacity);
-  meancache.resize(cachecapacity);
-  varcache.resize(cachecapacity);
+  cache.resize(cachecapacity);
 
   for (int i = 0; i < cachecapacity; i++) {
-    cachelist[i] = -1; // unused, free
+    cache[i].frame = -1; // unused, free
   }
 
   varnoise = noise * noise;
@@ -216,11 +223,11 @@ Deflicker::~Deflicker() {
 //	clear un-needed cache
 void Deflicker::clear_unnecessary_cache(int ndest, int range)
 {
-  for (std::vector<int>::iterator i = cachelist.begin(); i != cachelist.end(); ++i)
-  {
-    if (*i != -1 && (*i > ndest + range || *i + range < ndest))
-      *i = -1;
-  }
+    for (std::vector<CacheEntry>::iterator i = cache.begin(); i != cache.end(); ++i)
+    {
+        if (i->frame != -1 && (i->frame > ndest + range || i->frame + range < ndest))
+            i->frame = -1;
+    }
 }
 
 
@@ -228,13 +235,13 @@ void Deflicker::clear_unnecessary_cache(int ndest, int range)
 // check if  of this frame is in cache, get number of it
 int Deflicker::get_cache_number(int ndest)
 {
-  int found = -1;
-  for (std::vector<int>::const_iterator i = cachelist.begin(); found == -1 && i != cachelist.end(); ++i)
-  {
-    if (*i == ndest)
-      found = i - cachelist.begin();
-  }
-  return found;
+    int found = -1;
+    for (std::vector<CacheEntry>::const_iterator i = cache.begin(); found == -1 && i != cache.end(); ++i)
+    {
+        if (i->frame == ndest)
+            found = i - cache.begin();
+    }
+    return found;
 }
 
 //
@@ -242,13 +249,13 @@ int Deflicker::get_cache_number(int ndest)
 //
 int Deflicker::get_free_cache_number()
 {
-  int found = -1;
-  for (std::vector<int>::const_iterator i = cachelist.begin(); found == -1 && i != cachelist.end(); ++i)
-  {
-    if (*i == -1)
-      found = i - cachelist.begin();
-  }
-  return found;
+    int found = -1;
+    for (std::vector<CacheEntry>::const_iterator i = cache.begin(); found == -1 && i != cache.end(); ++i)
+    {
+        if (i->frame == -1)
+            found = i - cache.begin();
+    }
+    return found;
 }
 //
 //****************************************************************************
@@ -853,8 +860,8 @@ int Deflicker::get_frame_stats(size_t n_frame, int plane, IScriptEnvironment* en
     int n = get_cache_number(n_frame);
     if (n >= 0)
     { // from cache
-        mean = meancache[n];
-        var = varcache[n];
+        mean = cache[n].mean;
+        var = cache[n].var;
     }
     else
     { // will calculate now
@@ -909,9 +916,9 @@ int Deflicker::get_frame_stats(size_t n_frame, int plane, IScriptEnvironment* en
 
         // put to cache
         n = get_free_cache_number();
-        cachelist[n] = n_frame;
-        meancache[n] = mean; // non-smoothed measured value
-        varcache[n] = var;
+        cache[n].frame = n_frame;
+        cache[n].mean = mean; // non-smoothed measured value
+        cache[n].var = var;
     }
     o_mean = mean;
     o_var = var;
@@ -951,7 +958,7 @@ int Deflicker::fill_cache_for_smoothed(int ndest, IScriptEnvironment* env)
         if (ncur != ndest)
         { //then may be next as new scene
             int n = get_cache_number(ncur + lagsign); // check  frame ncur+1 (previosly calculated)
-            if (abs(meancache[n] - mean) > scene || 2 * fabs(sqrt(varcache[n]) - sqrt(var)) > scene)
+            if (abs(cache[n].mean - mean) > scene || 2 * fabs(sqrt(cache[n].var) - sqrt(var)) > scene)
             {
                 // we compared mean luma and std.var with previous for new scene detect
                 newbase = ncur + lagsign;// new scene at ncur+1
@@ -967,8 +974,8 @@ void Deflicker::calculate_smoothed(int nbase, int ndest, double& o_meansmoothed,
     int n = get_cache_number(nbase);
 
     // some intial values for model parameters:
-    double meansmoothed = meancache[n];//  mean luma
-    double var = varcache[n]; // variation
+    double meansmoothed = cache[n].mean;//  mean luma
+    double var = cache[n].var; // variation
     // initial coeff.
     double mult = 1;
     double add = 0;
@@ -1015,8 +1022,8 @@ void Deflicker::calculate_smoothed(int nbase, int ndest, double& o_meansmoothed,
             double var_y = a * a * var; // variation of true y from old varequ and a,b
 
             n = get_cache_number(ncur);
-            double meancur = meancache[n]; //  luma partially equlized mean value
-            var = varcache[n]; // new (current) variation of z
+            double meancur = cache[n].mean; //  luma partially equlized mean value
+            var = cache[n].var; // new (current) variation of z
             // var eta = varnoise
             double alfa = sqrt((var - varnoise) / var_y); // alfa estimation
 
@@ -1076,7 +1083,7 @@ void Deflicker::calculate_smoothed(int nbase, int ndest, double& o_meansmoothed,
 
     if (debug != 0)
     {
-        sprintf(&debugbuf[0], "Deflicker: dest=%d base=%d mean=%5.1lf sq.var=%5.1lf mult=%5.3f add=%6.1f smoothed=%5.1f\n", ndest, nbase, meancache[n], sqrt(varcache[n]), mult, add, meansmoothed);
+        sprintf(&debugbuf[0], "Deflicker: dest=%d base=%d mean=%5.1lf sq.var=%5.1lf mult=%5.3f add=%6.1f smoothed=%5.1f\n", ndest, nbase, cache[n].mean, sqrt(cache[n].var), mult, add, meansmoothed);
         OutputDebugString(&debugbuf[0]);
     }
 
@@ -1127,16 +1134,16 @@ void Deflicker::calculate_adjustment(double l, double r,
 void Deflicker::calculate_toward_dark(int ndarkest_l, int ndarkest_r, int ndest, double& o_meansmoothed, double& o_mult, double& o_add)
 {
     int n = get_cache_number(ndarkest_l);
-    const double meandarkest_l = meancache[n];
-    const double vardarkest_l = varcache[n];
+    const double meandarkest_l = cache[n].mean;
+    const double vardarkest_l = cache[n].var;
 
     n = get_cache_number(ndarkest_r);
-    const double meandarkest_r = meancache[n];
-    const double vardarkest_r = varcache[n];
+    const double meandarkest_r = cache[n].mean;
+    const double vardarkest_r = cache[n].var;
 
     n = get_cache_number(ndest);
-    const double meandest = meancache[n];
-    const double vardest = varcache[n];
+    const double meandest = cache[n].mean;
+    const double vardest = cache[n].var;
 
     const double dist = ndarkest_r - ndarkest_l;
     const double dist_l = ndest - ndarkest_l;
@@ -1372,9 +1379,9 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
     DrawString(dst, vi, xmsg, ymsg + 1, &messagebuf[0]);
     sprintf(&messagebuf[0], " base =%7d", nbase);
     DrawString(dst, vi, xmsg, ymsg + 2, &messagebuf[0]);
-    sprintf(&messagebuf[0], " mean   = %5.1lf", meancache[n]);
+    sprintf(&messagebuf[0], " mean   = %5.1lf", cache[n].mean);
     DrawString(dst, vi, xmsg, ymsg + 3, &messagebuf[0]);
-    sprintf(&messagebuf[0], " sq.var =%5.1lf", sqrt(varcache[n]));
+    sprintf(&messagebuf[0], " sq.var =%5.1lf", sqrt(cache[n].var));
     DrawString(dst, vi, xmsg, ymsg + 4, &messagebuf[0]);
     sprintf(&messagebuf[0], " mult= %7.3f", mult);
     DrawString(dst, vi, xmsg, ymsg + 5, &messagebuf[0]);
