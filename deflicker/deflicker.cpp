@@ -38,6 +38,17 @@
 
 struct CacheEntry
 {
+    CacheEntry() :
+        frame(-1),
+        mean(0.0),
+        var(0.0),
+        mean_u(-1.0),
+        var_u(-1.0),
+        mean_v(-1.0),
+        var_v(-1.0)
+    {
+    }
+
     int frame;
     double mean;
     double var;
@@ -112,7 +123,8 @@ private:
     void calculate_smoothed(int nbase, int ndest, double& o_meansmoothed, double& o_mult, double& o_add);
 
     int fill_cache_for_toward_dark(int ndest, IScriptEnvironment* env, bool right);
-    void calculate_toward_dark(int ndarkest_l, int ndarkest_r, int ndest, double& o_meansmoothed, double& o_mult, double& o_add);
+    void calculate_toward_dark(int ndarkest_l, int ndarkest_r, int ndest, double& meansmoothed, double& msm_u, double& msm_v,
+        double& mult, double& add, double &mult_u, double &add_u, double& mult_v, double& add_v);
     void calculate_adjustment(double l, double r,
         double meandarkest_l, double vardarkest_l, double meandarkest_r, double vardarkest_r,
         double meandest, double vardest,
@@ -196,6 +208,7 @@ Deflicker::Deflicker(PClip _child, double _percent, int _lag, double _noise, int
 
   for (int i = 0; i < cachecapacity; i++) {
     cache[i].frame = -1; // unused, free
+    cache[i].mean_u = cache[i].mean_v = cache[i].var_u = cache[i].var_v = -1.0;
   }
 
   varnoise = noise * noise;
@@ -226,7 +239,10 @@ void Deflicker::clear_unnecessary_cache(int ndest, int range)
     for (std::vector<CacheEntry>::iterator i = cache.begin(); i != cache.end(); ++i)
     {
         if (i->frame != -1 && (i->frame > ndest + range || i->frame + range < ndest))
+        {
             i->frame = -1;
+            i->mean_u = i->mean_v = i->var_u = i->var_v = -1.0;
+        }
     }
 }
 
@@ -852,16 +868,29 @@ int Deflicker::get_frame_stats(size_t n_frame, int plane, IScriptEnvironment* en
     else
         borderw = border; // for YV12
 
-    double mean;
-    double var;
+    double mean = 0;
+    double var = 0;
 
     // get min, max, and mean luma of current frame
     // check cache
     int n = get_cache_number(n_frame);
-    if (n >= 0)
+    if (n >= 0 && (plane != PLANAR_U || cache[n].mean_u >= 0) && (plane != PLANAR_V || cache[n].mean_v >= 0))
     { // from cache
-        mean = cache[n].mean;
-        var = cache[n].var;
+        if (plane == 0)
+        {
+            mean = cache[n].mean;
+            var = cache[n].var;
+        }
+        else if (plane == PLANAR_U)
+        {
+            mean = cache[n].mean_u;
+            var = cache[n].var_u;
+        }
+        else if (plane == PLANAR_V)
+        {
+            mean = cache[n].mean_v;
+            var = cache[n].var_v;
+        }
     }
     else
     { // will calculate now
@@ -915,10 +944,26 @@ int Deflicker::get_frame_stats(size_t n_frame, int plane, IScriptEnvironment* en
         var = var - mean*mean; // correction
 
         // put to cache
-        n = get_free_cache_number();
-        cache[n].frame = n_frame;
-        cache[n].mean = mean; // non-smoothed measured value
-        cache[n].var = var;
+        if (n < 0)
+        {
+            n = get_free_cache_number();
+            cache[n].frame = n_frame;
+        }
+        if (plane == 0)
+        {
+            cache[n].mean = mean; // non-smoothed measured value
+            cache[n].var = var;
+        }
+        else if (plane == PLANAR_U)
+        {
+            cache[n].mean_u = mean;
+            cache[n].var_u = var;
+        }
+        else if (plane == PLANAR_V)
+        {
+            cache[n].mean_v = mean;
+            cache[n].var_v = var;
+        }
     }
     o_mean = mean;
     o_var = var;
@@ -1105,11 +1150,16 @@ int Deflicker::fill_cache_for_toward_dark(int ndest, IScriptEnvironment* env, bo
         double mean;
         double var;
 
-        get_frame_stats(i, 0, env, mean, var);
+        const int n = get_frame_stats(i, 0, env, mean, var);
         if (min_mean > mean)
         {
             min_mean = mean;
             min_mean_nframe = i;
+        }
+        if (vi.IsYV24())
+        {
+            get_frame_stats(i, PLANAR_U, env, mean, var);
+            get_frame_stats(i, PLANAR_V, env, mean, var);
         }
     }
     return min_mean_nframe;
@@ -1131,19 +1181,12 @@ void Deflicker::calculate_adjustment(double l, double r,
     o_meansmoothed = meandarkest;
 }
 
-void Deflicker::calculate_toward_dark(int ndarkest_l, int ndarkest_r, int ndest, double& o_meansmoothed, double& o_mult, double& o_add)
+void Deflicker::calculate_toward_dark(int ndarkest_l, int ndarkest_r, int ndest, double& meansmoothed, double& msm_u, double& msm_v,
+    double& mult, double& add, double& mult_u, double& add_u, double& mult_v, double& add_v)
 {
-    int n = get_cache_number(ndarkest_l);
-    const double meandarkest_l = cache[n].mean;
-    const double vardarkest_l = cache[n].var;
-
-    n = get_cache_number(ndarkest_r);
-    const double meandarkest_r = cache[n].mean;
-    const double vardarkest_r = cache[n].var;
-
-    n = get_cache_number(ndest);
-    const double meandest = cache[n].mean;
-    const double vardest = cache[n].var;
+    const int n_l = get_cache_number(ndarkest_l);
+    const int n_r = get_cache_number(ndarkest_r);
+    const int n = get_cache_number(ndest);
 
     const double dist = ndarkest_r - ndarkest_l;
     const double dist_l = ndest - ndarkest_l;
@@ -1155,7 +1198,14 @@ void Deflicker::calculate_toward_dark(int ndarkest_l, int ndarkest_r, int ndest,
         l = 1.;
     double r = 1. - l;
 
-    calculate_adjustment(l, r, meandarkest_l, vardarkest_l, meandarkest_r, vardarkest_r, meandest, vardest, o_meansmoothed, o_mult, o_add);
+    calculate_adjustment(l, r, cache[n_l].mean, cache[n_l].var, cache[n_r].mean, cache[n_r].var, cache[n].mean, cache[n].var, meansmoothed, mult, add);
+    if (vi.IsYV24())
+    {
+        calculate_adjustment(l, r, cache[n_l].mean_u, cache[n_l].var_u, cache[n_r].mean_u, cache[n_r].var_u,
+            cache[n].mean_u, cache[n].var_u, msm_u, mult_u, add_u);
+        calculate_adjustment(l, r, cache[n_l].mean_v, cache[n_l].var_v, cache[n_r].mean_v, cache[n_r].var_v,
+            cache[n].mean_v, cache[n].var_v, msm_v, mult_v, add_v);
+    }
 }
 
 void Deflicker::CorrectFrame(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, short mult256w, short addw, short lmin, short lmax)
@@ -1197,7 +1247,14 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   int h;
   int nbase;
   double meansmoothed;
-  double mult, add;
+  double msm_u;
+  double msm_v;
+  double mult;
+  double add;
+  double mult_u;
+  double add_u;
+  double mult_v;
+  double add_v;
 
   int lastsrc = -1;
 
@@ -1249,7 +1306,7 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
           const PVideoFrame src = child->GetFrame(ndest, env);
           return src;
       }
-      calculate_toward_dark(darkest_l, darkest_r, ndest, meansmoothed, mult, add);
+      calculate_toward_dark(darkest_l, darkest_r, ndest, meansmoothed, msm_u, msm_v, mult, add, mult_u, add_u, mult_v, add_v);
   }
   else
   {
@@ -1296,8 +1353,29 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   {
     // copy chroma planes
     if (vi.NumComponents() >= 3) {
-      copy_plane(dst, src, PLANAR_U, env);
-      copy_plane(dst, src, PLANAR_V, env);
+        if (!toward_darkest || !vi.IsYV24())
+        {
+            copy_plane(dst, src, PLANAR_U, env);
+            copy_plane(dst, src, PLANAR_V, env);
+        }
+        else
+        {
+            const BYTE* c_srcp = src->GetReadPtr(PLANAR_U);
+            int c_src_pitch = src->GetPitch(PLANAR_U);
+            int c_src_height = src->GetHeight(PLANAR_U);
+            int c_src_width = src->GetRowSize(PLANAR_U);
+            BYTE* c_dstp = dst->GetWritePtr(PLANAR_U);
+            int c_dst_pitch = dst->GetPitch(PLANAR_U);
+            CorrectFrame(c_dstp, c_dst_pitch, c_srcp, c_src_pitch, c_src_height, c_src_width, mult_u * 256, add_u, lmin, lmax);
+
+            c_srcp = src->GetReadPtr(PLANAR_V);
+            c_src_pitch = src->GetPitch(PLANAR_V);
+            c_src_height = src->GetHeight(PLANAR_V);
+            c_src_width = src->GetRowSize(PLANAR_V);
+            c_dstp = dst->GetWritePtr(PLANAR_V);
+            c_dst_pitch = dst->GetPitch(PLANAR_V);
+            CorrectFrame(c_dstp, c_dst_pitch, c_srcp, c_src_pitch, c_src_height, c_src_width, mult_v * 256, add_v, lmin, lmax);
+        }
     }
     // copy alpha plane
     if (vi.NumComponents() == 4)
@@ -1383,9 +1461,15 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
     DrawString(dst, vi, xmsg, ymsg + 3, &messagebuf[0]);
     sprintf(&messagebuf[0], " sq.var =%5.1lf", sqrt(cache[n].var));
     DrawString(dst, vi, xmsg, ymsg + 4, &messagebuf[0]);
-    sprintf(&messagebuf[0], " mult= %7.3f", mult);
+    if (toward_darkest)
+        sprintf(&messagebuf[0], " mult= %7.3f %7.3f %7.3f", mult, mult_u, mult_v);
+    else
+        sprintf(&messagebuf[0], " mult= %7.3f", mult);
     DrawString(dst, vi, xmsg, ymsg + 5, &messagebuf[0]);
-    sprintf(&messagebuf[0], " add = %7.1f", add);
+    if (toward_darkest)
+        sprintf(&messagebuf[0], " add= %7.3f %7.3f %7.3f", add, add_u, add_v);
+    else
+        sprintf(&messagebuf[0], " add = %7.1f", add);
     DrawString(dst, vi, xmsg, ymsg + 6, &messagebuf[0]);
     sprintf(&messagebuf[0], " m.fixed=%5.1f", meansmoothed);
     DrawString(dst, vi, xmsg, ymsg + 7, &messagebuf[0]);
