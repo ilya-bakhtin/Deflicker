@@ -97,13 +97,19 @@ private:
     void clear_unnecessary_cache(int ndest, int range);
     int get_cache_number(int ndest);
     int get_free_cache_number();
-    int get_frame_stats(size_t n_frame, IScriptEnvironment* env, double& mean, double& var);
+    int get_frame_stats(size_t n_frame, int plane, IScriptEnvironment* env, double& mean, double& var);
 
     int fill_cache_for_smoothed(int ndest, IScriptEnvironment* env);
     void calculate_smoothed(int nbase, int ndest, double& o_meansmoothed, double& o_mult, double& o_add);
 
     int fill_cache_for_toward_dark(int ndest, IScriptEnvironment* env, bool right);
     void calculate_toward_dark(int ndarkest_l, int ndarkest_r, int ndest, double& o_meansmoothed, double& o_mult, double& o_add);
+    void calculate_adjustment(double l, double r,
+        double meandarkest_l, double vardarkest_l, double meandarkest_r, double vardarkest_r,
+        double meandest, double vardest,
+        double& o_meansmoothed, double& o_mult, double& o_add);
+
+    void CorrectFrame(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, short mult256w, short addw, short lmin, short lmax);
 };
 
 /***************************
@@ -136,6 +142,8 @@ Deflicker::Deflicker(PClip _child, double _percent, int _lag, double _noise, int
     env->ThrowError("Deflicker: input to filter must be Y, YUV or YUY2!");
   if (vi.BitsPerComponent() > 8)
     env->ThrowError("Deflicker: only 8 bit clips supported");
+  if (toward_darkest && !vi.IsYV24())
+    env->ThrowError("Deflicker: toward_darkest is only supported for YV24");
 
   isYUY2 = vi.IsYUY2();
 
@@ -829,7 +837,7 @@ void SumFrame_c(const BYTE* srcp, int src_pitch, int width, int height, int bord
   }
 }
 
-int Deflicker::get_frame_stats(size_t n_frame, IScriptEnvironment* env, double& o_mean, double& o_var)
+int Deflicker::get_frame_stats(size_t n_frame, int plane, IScriptEnvironment* env, double& o_mean, double& o_var)
 {
     int borderw;
     if (isYUY2)
@@ -853,10 +861,10 @@ int Deflicker::get_frame_stats(size_t n_frame, IScriptEnvironment* env, double& 
         const PVideoFrame src = child->GetFrame(n_frame, env);
  //       lastsrc = ncur;
         // Request a Read pointer from the source frame.
-        const BYTE* srcp = src->GetReadPtr();
-        const int src_pitch = src->GetPitch();
-        const int src_width = src->GetRowSize();
-        const int src_height = src->GetHeight();
+        const BYTE* srcp = src->GetReadPtr(plane);
+        const int src_pitch = src->GetPitch(plane);
+        const int src_width = src->GetRowSize(plane);
+        const int src_height = src->GetHeight(plane);
 
         int64_t mean64 = 0; // mean luma, 32 ibt int is good for summing up 2^23 pixels (8 388 608) in 8 bit
         int64_t var64 = 0; // luma variation
@@ -924,7 +932,7 @@ int Deflicker::fill_cache_for_smoothed(int ndest, IScriptEnvironment* env)
         double mean;
         double var;
 
-        get_frame_stats(ncur, env, mean, var);
+        get_frame_stats(ncur, 0, env, mean, var);
 
         // check scenechange
 
@@ -1090,7 +1098,7 @@ int Deflicker::fill_cache_for_toward_dark(int ndest, IScriptEnvironment* env, bo
         double mean;
         double var;
 
-        get_frame_stats(i, env, mean, var);
+        get_frame_stats(i, 0, env, mean, var);
         if (min_mean > mean)
         {
             min_mean = mean;
@@ -1100,19 +1108,35 @@ int Deflicker::fill_cache_for_toward_dark(int ndest, IScriptEnvironment* env, bo
     return min_mean_nframe;
 }
 
+void Deflicker::calculate_adjustment(double l, double r,
+    double meandarkest_l, double vardarkest_l, double meandarkest_r, double vardarkest_r,
+    double meandest, double vardest,
+    double& o_meansmoothed, double& o_mult, double& o_add)
+{
+    const double meandarkest = meandarkest_l * l + meandarkest_r * r;
+    const double vardarkest = sqrt(vardarkest_l) * l + sqrt(vardarkest_r) * r;
+
+    const double alfa = sqrt(vardest) / vardarkest;
+    const double beta = meandest / alfa - meandarkest;
+
+    o_mult = 1. / alfa;
+    o_add = -beta;
+    o_meansmoothed = meandarkest;
+}
+
 void Deflicker::calculate_toward_dark(int ndarkest_l, int ndarkest_r, int ndest, double& o_meansmoothed, double& o_mult, double& o_add)
 {
     int n = get_cache_number(ndarkest_l);
-    double meandarkest_l = meancache[n];
-    double vardarkest_l = varcache[n];
+    const double meandarkest_l = meancache[n];
+    const double vardarkest_l = varcache[n];
 
     n = get_cache_number(ndarkest_r);
-    double meandarkest_r = meancache[n];
-    double vardarkest_r = varcache[n];
+    const double meandarkest_r = meancache[n];
+    const double vardarkest_r = varcache[n];
 
     n = get_cache_number(ndest);
-    double meandest = meancache[n];
-    double vardest = varcache[n];
+    const double meandest = meancache[n];
+    const double vardest = varcache[n];
 
     const double dist = ndarkest_r - ndarkest_l;
     const double dist_l = ndest - ndarkest_l;
@@ -1124,15 +1148,38 @@ void Deflicker::calculate_toward_dark(int ndarkest_l, int ndarkest_r, int ndest,
         l = 1.;
     double r = 1. - l;
 
-    const double meandarkest = meandarkest_l * l + meandarkest_r * r;
-    const double vardarkest = sqrt(vardarkest_l) * l + sqrt(vardarkest_r) * r;
+    calculate_adjustment(l, r, meandarkest_l, vardarkest_l, meandarkest_r, vardarkest_r, meandest, vardest, o_meansmoothed, o_mult, o_add);
+}
 
-    const double alfa = sqrt(vardest) / vardarkest;
-    const double beta = meandest / alfa - meandarkest;
-
-    o_mult = 1./alfa;
-    o_add = -beta;
-    o_meansmoothed = meandarkest;
+void Deflicker::CorrectFrame(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, short mult256w, short addw, short lmin, short lmax)
+{
+    if (has_AVX2) {
+        if (isYUY2)
+            CorrectFrame_YUY2_avx2(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
+        else
+            CorrectFrame_avx2(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
+    }
+    else if (has_SSE2)
+    {
+        if (isYUY2)
+            CorrectFrame_YUY2_sse2(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
+        else
+            CorrectFrame_sse2(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
+    }
+#ifndef X86_64
+    else if (has_SSE) {
+        if (isYUY2)
+            CorrectFrame_YUY2_isse(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
+        else
+            CorrectFrame_isse(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
+    }
+#endif
+    else {
+        if (isYUY2)
+            CorrectFrame_YUY2_c(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
+        else
+            CorrectFrame_c(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
+    }
 }
 
 PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
@@ -1252,33 +1299,7 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
 
   // deal with the Y Plane
     // luma correction	
-  if (has_AVX2) {
-    if (isYUY2)
-      CorrectFrame_YUY2_avx2(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
-    else
-      CorrectFrame_avx2(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
-  }
-  else if (has_SSE2)
-  {
-    if (isYUY2)
-      CorrectFrame_YUY2_sse2(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
-    else
-      CorrectFrame_sse2(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
-  }
-#ifndef X86_64
-  else if (has_SSE) {
-    if (isYUY2)
-      CorrectFrame_YUY2_isse(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
-    else
-      CorrectFrame_isse(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
-  }
-#endif
-  else {
-    if (isYUY2)
-      CorrectFrame_YUY2_c(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
-    else
-      CorrectFrame_c(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
-  }
+  CorrectFrame(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
 
   // make border visible
   if (info != 0 && border > 0)
