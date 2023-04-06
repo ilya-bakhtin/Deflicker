@@ -1070,7 +1070,8 @@ void Deflicker::calculate_smoothed(int nbase, int ndest, double& o_meansmoothed,
             double meancur = cache[n].mean; //  luma partially equlized mean value
             var = cache[n].var; // new (current) variation of z
             // var eta = varnoise
-            double alfa = sqrt((var - varnoise) / var_y); // alfa estimation
+            double alfa2 = (var - varnoise) / var_y;
+            double alfa = sqrt(alfa2); // alfa estimation
 
             // E(z(n)) = meancur; // mean of z(n) is simply mean of luma
 
@@ -1081,7 +1082,7 @@ void Deflicker::calculate_smoothed(int nbase, int ndest, double& o_meansmoothed,
             // estimation solution:
             double beta = meancur - alfa * meansmoothed;
 
-            a = sqrt((var - varnoise) / (var * alfa)); // the article has error: no sqrt!
+            a = sqrt((var - varnoise) / (var * alfa2)); // the article has error: no sqrt!
             b = -beta / alfa + meancur * (1 / alfa - a); // there was error too !
 
             // that is all,
@@ -1091,9 +1092,10 @@ void Deflicker::calculate_smoothed(int nbase, int ndest, double& o_meansmoothed,
             //  but we can improve predicted solution by corrector,
             //using calculated values for iteration
             var_y = a * a * var; // variation of true y
-            alfa = sqrt((var - varnoise) / var_y); // alfa correction
+            alfa2 = (var - varnoise) / var_y;
+            alfa = sqrt(alfa2); // alfa correction
             beta = meancur - alfa * meansmoothed;  // alfa correction
-            a = sqrt((var - varnoise) / (var * alfa)); // the article has error, without sqrt!
+            a = sqrt((var - varnoise) / (var * alfa2)); // the article has error, without sqrt!
             b = -beta / alfa + meancur * (1 / alfa - a); // there was error too !
 
             // prepare  for next frame calculation
