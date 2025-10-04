@@ -147,7 +147,7 @@ private:
         double meandest, double vardest,
         double& o_meansmoothed, double& o_mult, double& o_add);
 
-    void CorrectFrame(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, short mult256w, short addw, short lmin, short lmax);
+    void CorrectFrame(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, double mult256w, double addw, short lmin, short lmax);
 };
 
 /***************************
@@ -524,14 +524,13 @@ static void __forceinline SumLine_sse2(const BYTE* srcp, int width, int* mean, i
 //
 //****************************************************************************
 //
-static void __forceinline CorrectYUY2_c(BYTE* dstp, const BYTE* srcp, int src_width, short mult256w, short addw, short lmin, short lmax)
+static void __forceinline CorrectYUY2_c(BYTE* dstp, const BYTE* srcp, int src_width, const BYTE* lut)
 { // correct luma 
-  for (int w = 0; w < src_width; w += 2) // every 2
-  {
-    int cur = ((srcp[w] * mult256w) >> 8) + addw;
-    dstp[w] = min(max(cur, lmin), lmax); //Y
-    dstp[w + 1] = srcp[w + 1]; // U,V
-  }
+    for (int w = 0; w < src_width; w += 2) // every 2
+    {
+        dstp[w] = lut[srcp[w]]; //Y
+        dstp[w + 1] = srcp[w + 1]; // U,V
+    }
 }
 
 //
@@ -596,13 +595,21 @@ static void __forceinline CorrectYUY2_isse(BYTE* dstp, const BYTE* srcp, int src
 //
 //****************************************************************************
 //
-static void __forceinline CorrectYUV_c(BYTE* dstp, const BYTE* srcp, int src_width, short mult256w, short addw, short lmin, short lmax)
-{ // correct luma 
-  for (int w = 0; w < src_width; w += 1) // every 1
-  {
-    int cur = ((srcp[w] * mult256w) >> 8) + addw;
-    dstp[w] = min(max(cur, lmin), lmax);
-  }
+static void __forceinline CorrectYUV_c(BYTE* dstp, const BYTE* srcp, int src_width, const BYTE* lut)
+{ // correct luma
+    for (int w = 0; w < src_width; ++w) // every 1
+    {
+        dstp[w] = lut[srcp[w]];
+    }
+/*
+    short mult = round(mult256w * 256);
+    short add = round(addw);
+    for (int w = 0; w < src_width; w += 1) // every 1
+    {
+        int cur = ((int(srcp[w]) * mult + 128) >> 8) + add;
+        dstp[w] = min(max(cur, lmin), lmax);
+    }
+*/
 }
 
 static void __forceinline CorrectYUV_sse2(BYTE* dstp, const BYTE* srcp, int src_width, short mult256w, short addw, short lmin, short lmax)
@@ -776,24 +783,40 @@ void CorrectFrame_isse(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitc
 }
 #endif
 
-void CorrectFrame_YUY2_c(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, short mult256w, short addw, short lmin, short lmax)
+void CorrectFrame_YUY2_c(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, double mult256w, double addw, short lmin, short lmax)
 {
-  for (int h = 0; h < src_height; h++)
-  {       // Loop from top line to bottom line 
-    CorrectYUY2_c(dstp, srcp, src_width, mult256w, addw, lmin, lmax);
-    srcp += src_pitch;
-    dstp += dst_pitch;
-  }
+    BYTE lut[256];
+
+    for (int c = 0; c < 256; ++c)
+    {
+        int cur = round(c * mult256w + addw);
+        lut[c] = min(max(cur, lmin), lmax);
+    }
+
+    for (int h = 0; h < src_height; h++)
+    {   // Loop from top line to bottom line
+        CorrectYUY2_c(dstp, srcp, src_width, lut);
+        srcp += src_pitch;
+        dstp += dst_pitch;
+    }
 }
 
-void CorrectFrame_c(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, short mult256w, short addw, short lmin, short lmax)
+void CorrectFrame_c(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, double mult256w, double addw, short lmin, short lmax)
 {
-  for (int h = 0; h < src_height; h++)
-  {       // Loop from top line to bottom line 
-    CorrectYUV_c(dstp, srcp, src_width, mult256w, addw, lmin, lmax);
-    srcp += src_pitch;
-    dstp += dst_pitch;
-  }
+    BYTE lut[256];
+
+    for (int c = 0; c < 256; ++c)
+    {
+        int cur = round(c * mult256w + addw);
+        lut[c] = min(max(cur, lmin), lmax);
+    }
+
+    for (int h = 0; h < src_height; h++)
+    {   // Loop from top line to bottom line
+        CorrectYUV_c(dstp, srcp, src_width, lut);
+        srcp += src_pitch;
+        dstp += dst_pitch;
+    }
 }
 
 //
@@ -1379,8 +1402,9 @@ void Deflicker::calculate_toward_dark(int ndarkest_l, int ndarkest_r, int ndest,
     }
 }
 
-void Deflicker::CorrectFrame(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, short mult256w, short addw, short lmin, short lmax)
+void Deflicker::CorrectFrame(BYTE* dstp, int dst_pitch, const BYTE* srcp, int src_pitch, int src_height, int src_width, double mult256w, double addw, short lmin, short lmax)
 {
+#if 0
     if (has_AVX2) {
         if (isYUY2)
             CorrectFrame_YUY2_avx2(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
@@ -1402,7 +1426,9 @@ void Deflicker::CorrectFrame(BYTE* dstp, int dst_pitch, const BYTE* srcp, int sr
             CorrectFrame_isse(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
     }
 #endif
-    else {
+    else
+#endif
+    {
         if (isYUY2)
             CorrectFrame_YUY2_c(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
         else
@@ -1471,7 +1497,7 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
           const PVideoFrame src = child->GetFrame(ndest, env);
           return src;
       }
-      calculate_toward_dark(darkest_l, darkest_r, ndest, meansmoothed, msm_u, msm_v, mult, add, mult_u, add_u, mult_v, add_v);
+//      calculate_toward_dark(darkest_l, darkest_r, ndest, meansmoothed, msm_u, msm_v, mult, add, mult_u, add_u, mult_v, add_v);
   }
   else
   {
@@ -1484,8 +1510,8 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
   // get short integer scaled coefficients
 //	mult256i = mult*256;
 //	add256i = add*256;
-  short mult256w = mult * 256;
-  short addw = add;
+  short mult256w = round(mult*256);
+  short addw = round(add*256);
 
   // now make correction
 
@@ -1531,7 +1557,7 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
             int c_src_width = src->GetRowSize(PLANAR_U);
             BYTE* c_dstp = dst->GetWritePtr(PLANAR_U);
             int c_dst_pitch = dst->GetPitch(PLANAR_U);
-            CorrectFrame(c_dstp, c_dst_pitch, c_srcp, c_src_pitch, c_src_height, c_src_width, mult_u * 256, add_u, lmin, lmax);
+            CorrectFrame(c_dstp, c_dst_pitch, c_srcp, c_src_pitch, c_src_height, c_src_width, mult_u, add_u, lmin, lmax);
 
             c_srcp = src->GetReadPtr(PLANAR_V);
             c_src_pitch = src->GetPitch(PLANAR_V);
@@ -1539,7 +1565,7 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
             c_src_width = src->GetRowSize(PLANAR_V);
             c_dstp = dst->GetWritePtr(PLANAR_V);
             c_dst_pitch = dst->GetPitch(PLANAR_V);
-            CorrectFrame(c_dstp, c_dst_pitch, c_srcp, c_src_pitch, c_src_height, c_src_width, mult_v * 256, add_v, lmin, lmax);
+            CorrectFrame(c_dstp, c_dst_pitch, c_srcp, c_src_pitch, c_src_height, c_src_width, mult_v, add_v, lmin, lmax);
         }
     }
     // copy alpha plane
@@ -1549,7 +1575,7 @@ PVideoFrame __stdcall Deflicker::GetFrame(int ndest, IScriptEnvironment* env) {
 
   // deal with the Y Plane
     // luma correction	
-  CorrectFrame(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult256w, addw, lmin, lmax);
+  CorrectFrame(dstp, dst_pitch, srcp, src_pitch, src_height, src_width, mult, add, lmin, lmax);
 
   // make border visible
   if (info != 0 && border > 0)
